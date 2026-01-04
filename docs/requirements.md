@@ -5,9 +5,10 @@
 Build a production-style limit order book + matching engine in modern C++ (C++17/20) that demonstrates:
 
 - Correct **price–time priority** matching
-- Strong engineering discipline (determinism, memory ownership, testability)
-- Measurable low-latency performance, targeting **< 2 microseconds** for the **engine-only** hot path
+- Strong engineering discipline: determinism, memory ownership, testability
+- Measurable low-latency performance targeting **< 2 microseconds** for the **engine-only** hot path
 
+This project is explicitly latency-oriented: a “correct but allocation-heavy” implementation is considered a failure.
 
 ---
 
@@ -17,9 +18,9 @@ Build a production-style limit order book + matching engine in modern C++ (C++17
 
 **Engine-only latency** is measured from:
 
-- **t0**: after an incoming message is decoded into an internal `Command` POD  
+- **t0**: immediately after an incoming message is decoded into an internal `Command` POD  
 to
-- **t1**: after the engine finishes processing the command and has emitted all resulting `Event`s into the output sink (e.g., ring buffer)
+- **t1**: immediately after the engine finishes processing the command and has emitted all resulting `Event`s into the output sink (e.g., ring buffer)
 
 This metric **excludes**:
 - syscalls, TCP read/write, kernel scheduling
@@ -41,19 +42,21 @@ A second metric, **wire-to-ack**, may be reported separately.
 ### Phase 1 (MVP): Correct matching + basic performance
 - Single instrument
 - Limit orders + cancel by order id
-- Price–time priority
-- Deterministic replay
+- Price–time priority (FIFO per price level)
+- Deterministic replay (golden output)
 - Benchmark harness for engine-only latency
 
 ### Phase 2 (Optimization): Data-structure replacements
 - Replace `std::map` with flatter structures (e.g., `flat_map` / sorted vector / ladder)
-- Remove `unordered_map` if needed (custom fixed-capacity hash)
+- Replace `unordered_map` if needed (custom fixed-capacity open addressing)
 - Prove **no allocations in hot path**
+- Document performance changes and trade-offs
 
 ### Phase 3 (Networking): TCP gateway
-- Simple TCP server
-- Fixed-size binary protocol
-- Split threads optional (gateway thread(s) + engine thread + tx thread)
+- Simple TCP server (optional)
+- Fixed-size binary protocol (no JSON/text)
+- Split threads optional: gateway thread(s) + engine thread + tx thread
+- Separate “wire-to-ack” measurements
 
 ---
 
@@ -61,13 +64,13 @@ A second metric, **wire-to-ack**, may be reported separately.
 
 ### 4.1 Supported commands
 
-The engine must support the following commands:
+The engine must support:
 
 1. **AddLimit**
    - Fields: `order_id`, `side`, `price`, `qty`
 2. **Cancel**
    - Fields: `order_id`
-3. **Modify/Replace** (optional in Phase 1; required in Phase 2)
+3. **Modify/Replace** (optional Phase 1; required Phase 2)
    - Either:
      - `Modify(order_id, new_price?, new_qty?)`, or
      - `Replace(old_order_id, new_order_id, price, qty)` (cancel+add semantics)
@@ -81,28 +84,30 @@ The engine must support the following commands:
 
 When aggressive:
 - Match against resting liquidity starting at best price
-- Generate one or more trades until:
+- Generate one or more fills until:
   - incoming qty becomes 0 (fully filled), or
-  - book has no crossing liquidity
+  - the book has no crossing liquidity
 
 If incoming qty remains > 0:
-- Rest the remaining qty on the book at its limit price (FIFO at that level)
+- Rest remaining qty on the book at its limit price (FIFO at that level)
 
 ### 4.3 Validation and rejection
 
-The engine must reject invalid commands, emitting `REJECT` events, for:
+The engine must reject invalid commands (emit `REJECT` with a reason code):
+
 - `qty <= 0`
 - `price <= 0` for `AddLimit`
 - invalid `side`
 - duplicate `order_id` on `AddLimit`
 - unknown `order_id` on `Cancel` (and Modify if supported)
+- numeric overflow risk (policy must be explicit; recommended: reject)
 
 ### 4.4 Outputs (events)
 
-For each processed command, the engine emits zero or more `Event`s:
+For each processed command, the engine emits zero or more fixed-size POD `Event`s:
 
 - `ACK` — accepted command (e.g., accepted add/cancel)
-- `REJECT` — invalid command, with reason code
+- `REJECT` — invalid command + reason code
 - `FILL` — trade execution (includes maker/taker ids, price, qty)
 - `CANCELLED` — cancellation completed
 - `BOOK_UPDATE` — optional (Phase 2+; can be derived from stream)
@@ -115,50 +120,55 @@ For each processed command, the engine emits zero or more `Event`s:
 
 ### 5.1 Performance targets
 
-**Engine-only hot path** targets (release/perf mode, pinned core recommended):
+**Engine-only hot path** targets (release/perf mode; pinned core recommended):
 
 - Median latency: **< 2 µs**
-- p99 latency: project-defined budget (recommend starting goal: **< 10 µs**)
+- p99 latency: project-defined budget (recommended starting goal: **< 10 µs**)
 
 Benchmarks must report:
 - median / p95 / p99 latencies
 - throughput (msgs/sec)
 - CPU model, compiler version, build flags, pinning settings
+- a precise definition of what is included/excluded in the measurement window
 
 ### 5.2 Hot-path memory rules
 
 In the hot path (`Engine::process` → matching → event emission):
 
 - **No `new` / `delete`**
-- No allocations from STL containers (all reserved upfront)
+- No allocations from STL containers (all reserved upfront; fixed-size where possible)
 - No `std::string`, iostream, logging, exceptions
 - Prefer `noexcept` where practical
 
 All memory for:
 - orders
-- per-order links
+- per-order links (intrusive)
 - command/event queues
 must be preallocated at startup.
 
 ### 5.3 Determinism
 
-- The matching engine must be **single-writer** for book state.
+- The matching engine must be a **single-writer** for book state.
 - Given the same command stream, the resulting event stream must be identical.
 
 ### 5.4 Reliability / safety
 
-- Numeric overflow handling rules must be explicit (recommend: reject on overflow risk)
-- In debug builds:
+- Overflow/underflow rules must be explicit.
+- Debug builds:
   - assertions enabled
   - sanitizers optionally enabled
 
 ### 5.5 Observability (non-hot path)
 
-- Counters (atomics or thread-local + aggregation):
-  - processed, rejects, trades, cancels
-  - current live orders
-  - current best bid/ask (optional)
-- Optional trace sampling (disabled by default in perf builds)
+Counters (thread-local or atomics + aggregation):
+- processed commands
+- rejects
+- trades
+- cancels
+- live orders
+- optional: best bid/ask, depth stats
+
+Optional trace sampling (disabled by default in perf builds).
 
 ---
 
@@ -168,25 +178,25 @@ must be preallocated at startup.
 - Unit tests cover:
   - FIFO at same price
   - partial fills
-  - multi-level sweep
+  - multi-level sweeps
   - cancel head/middle/tail
-  - reject cases
+  - rejection cases
 - Deterministic replay test:
   - input command file produces a stable golden output file
 
 ### 6.2 Performance
 - Benchmark harness included under `bench/`
-- Results and reproduction steps documented under `docs/performance.md`
-- Hot path allocation-free verified via one or more:
+- Results + reproduction steps documented under `docs/performance.md`
+- Hot-path allocation-free verified via one or more:
   - overridden global `operator new` in perf mode (abort on alloc)
   - malloc tracing (e.g., `LD_PRELOAD`) in tests
-  - `perf` / heap tracking evidence
+  - `perf` / heap-tracking evidence
 
 ---
 
 ## 7. Out of Scope (initially)
 
-- Auction / opening cross
+- Auctions / opening cross
 - Market orders, IOC/FOK, hidden/iceberg, pegged orders
 - STP (self-trade prevention)
 - Risk limits / credit checks

@@ -1,207 +1,162 @@
+# High-Performance Limit Order Book (Matching Engine) — Architecture
+
+## 1. Overview
+
+This system is a deterministic, allocation-free (hot path) matching engine designed as a pipeline:
+
+**Command (decoded input) → Engine (single-writer match) → Events (fixed-size outputs)**
+
+Primary design constraints:
+- **Single writer** mutates order book state (determinism).
+- **No syscalls** in the matching core.
+- **No dynamic allocation** in the hot path after startup.
+- **Binary POD protocol** at boundaries (no JSON/text).
+
+---
+
+## 2. Architecture Diagram
+
+# Phase 1 / Phase 2 - No networking
+
+
++-------------------------+
+| Workload / Tests / CLI  |
+| (generates Command POD) |
++-----------+-------------+
+            |
+            v
++-------------------------+
+|     MatchingEngine      |
+|  - validate             |
+|  - match (price-time)   |
+|  - rest / cancel        |
+|  - emit Events          |
+|  (single writer)        |
++-----------+-------------+
+            |
+            v
++-------------------------+
+|       EventSink         |
+|  - vector (tests)       |
+|  - ring buffer (perf)   |
++-------------------------+
+
+# Phase 3 - TCP Mode
+
++-----------+     +------------------+     +------------------+
+|  Socket   | --> | RX / Gateway     | --> |  Command Ring    |
+|           |     | read + decode    |     | (preallocated)   |
++-----------+     +------------------+     +--------+---------+
+                                                       |
+                                                       v
+                                            +------------------+
+                                            | Engine Thread    |
+                                            | MatchingEngine   |
+                                            | (single writer)  |
+                                            +--------+---------+
+                                                       |
+                                                       v
++-----------+     +------------------+     +------------------+
+|  Socket   | <-- | TX Thread        | <-- |   Event Ring     |
+|           |     | encode + write   |     | (preallocated)   |
++-----------+     +------------------+     +------------------+
+
+
+# Final diagram: 
+
+┌─────────────────────────────────────────────────────┐
+│                  TCP Server (Phase 3)               │
+│  ┌─────────────────────────────────────────────┐    │
+│  │   Parse incoming orders (simple text format)│    │
+│  └──────────────────┬──────────────────────────┘    │
+└────────────────────│────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────┐
+│              Matching Engine (Core)                 │
+│  ┌──────────────────────────────────────────────┐   │
+│  │  Order Validation & Routing                  │   │
+│  │  - Check price/qty validity                  │   │
+│  │  - Route to Bid/Ask book                     │   │
+│  └──────────────┬───────────────────────────────┘   │
+│                 │                                   │
+│  ┌──────────────▼──────────┐  ┌──────────────────┐  │
+│  │   Bid Book (std::map)   │  │  Ask Book        │  │
+│  │   Key: Price (desc)     │  │  Key: Price (asc)│  │
+│  │   Value: Queue<Order>   │  │  Value: Queue    │  │
+│  └──────────────┬──────────┘  └────────┬─────────┘  │
+│                 │                      │            │
+│  ┌──────────────▼───────────────────────▼─────────┐ │
+│  │         Matching Algorithm                     │ │
+│  │  - Walk book until fill or no match            │ │
+│  │  - Generate Trade objects                      │ │
+│  │  - Update/remove resting orders                │ │
+│  └────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────┐
+│              Object Pools (Memory Mgmt)             │
+│  - Order Pool: std::vector<Order> (preallocated)    │
+│  - Trade Pool: Reuse trade objects                  │
+│  - NO malloc/free in hot path                       │
+└─────────────────────────────────────────────────────┘
 
 Notes:
-- Engine thread is the **single writer** of book state.
-- Gateway threads perform I/O and encoding/decoding only.
-- Rings are preallocated fixed-size buffers.
+- Prefer **SPSC** rings when possible (RX→Engine, Engine→TX).
+- Use MPSC only if multiple RX threads are introduced (optional extension).
 
 ---
 
-## 3. Component Breakdown
+## 3. Key Invariants
 
-### 3.1 `common/`
-**Responsibilities**
-- Define core POD types and enums:
-  - `Price`, `Qty`, `OrderId`, `Side`
-  - `Command`, `Event`
-- Utility helpers for time measurement (optional):
-  - `rdtsc` wrappers / `clock_gettime` wrappers (bench only)
+### 3.1 Determinism
+- Engine processes a totally ordered stream of `Command`s.
+- Given identical input streams, emitted `Event`s are identical.
+- Matching core is single-threaded (or logically single-writer).
 
-**Rules**
-- No heap allocation.
-- Keep types trivially copyable where possible.
+### 3.2 Hot-path constraints
+Inside `MatchingEngine::process()` and any code it calls:
+- No `new/delete`, no container growth/rehash
+- No `std::string`, iostreams, logging
+- No blocking calls, no syscalls
+- Prefer `noexcept` for core processing surface
 
----
-
-### 3.2 `pool/`
-**Responsibilities**
-- `ObjectPool<Order>`: fixed-capacity pool for orders
-  - preallocated storage (e.g., `std::vector<Order>`)
-  - free-list for recycling
-- `OrderIndex`: map `OrderId -> handle/pointer`
-  - Phase 1: `std::unordered_map` with `reserve()` and possibly custom allocator
-  - Phase 2: custom open-addressing hash table (fixed capacity)
-
-**Why it exists**
-- Ensures constant-time order lookup for cancel/modify.
-- Ensures hot path has no `new/delete`.
+### 3.3 Ownership and lifetime
+- Resting orders live in an **OrderPool** (fixed capacity).
+- Cancel/fill recycles orders back to the pool.
+- Order lookup is via an **OrderIndex**: `OrderId -> handle`.
 
 ---
 
-### 3.3 `book/`
-Contains the order book state and book-side structures.
+## 4. Data Model
 
-#### `PriceLevel`
-**Responsibilities**
-- Represents a single price level:
-  - FIFO queue of orders (time priority)
-  - aggregate quantity at that level
+### 4.1 Core types (in `common/`)
+- `using OrderId = uint64_t;`
+- `using Price   = int64_t;`  (ticks)
+- `using Qty     = int32_t;`  (lots)
+- `enum class Side : uint8_t { Buy, Sell };`
 
-**Recommended implementation**
-- Intrusive linked list:
-  - each `Order` contains `prev/next` links (indices or pointers)
-  - O(1) remove for cancellations
+### 4.2 Commands and Events (POD boundaries)
 
-#### `OrderBookSide`
-**Responsibilities**
-- Owns and manages price levels for one side (bids OR asks).
-- Provides:
-  - find best price
-  - insert/find a price level
-  - remove empty levels
+#### `Command` (input to engine)
+- Fixed-size POD designed to be binary-protocol friendly.
+- Must contain:
+  - type: AddLimit / Cancel / Modify (optional)
+  - order_id (and possibly new_order_id for Replace)
+  - side (for AddLimit)
+  - price, qty (for AddLimit / Replace / Modify as defined)
 
-**Phase 1 structure**
-- `std::map<Price, PriceLevel>`:
-  - bids sorted descending
-  - asks sorted ascending
+Illustrative example (exact layout may differ):
+```cpp
+enum class CmdType : uint8_t { AddLimit, Cancel, Modify };
 
-**Phase 2 structure options**
-- `boost::container::flat_map`
-- sorted `std::vector<PriceLevel>` + binary search
-- bounded tick ladder (if tick range is known)
-
-#### `OrderBook`
-**Responsibilities**
-- Holds both sides:
-  - `bids`, `asks`
-- Exposes operations used by engine:
-  - `add_limit(order)`
-  - `cancel(order_id)`
-  - `match(order)` (internal)
-
-**Invariant**
-- Book state is modified only by the engine thread.
-
----
-
-### 3.4 `engine/`
-#### `MatchingEngine`
-**Responsibilities**
-- Single entry point:
-  - `process(const Command&, EventSink&) noexcept`
-- Performs:
-  - validation
-  - matching
-  - resting orders
-  - cancel/modify
-  - event emission
-
-**Hot path constraints**
-- No syscalls
-- No allocations
-- No exceptions / logging
-
-#### `RiskChecks` (optional)
-- Cheap checks only (e.g., max qty)
-- Must obey hot path constraints
-
----
-
-### 3.5 `io/` (Phase 3)
-#### `codec/`
-- Encode/decode `Command` and `Event` from/to a fixed binary format.
-- Avoid variable-length fields.
-
-#### `tcp/`
-- TCP accept loop + per-session I/O handling.
-- Recommended:
-  - `RX thread`: read buffer → decode → command ring
-  - `TX thread`: event ring → encode → write
-
----
-
-### 3.6 `bench/`
-**Responsibilities**
-- Synthetic workload generation:
-  - mix of adds/cancels/aggressive orders
-  - configurable depth, level count, order distributions
-- Latency measurement:
-  - record per-command engine-only timings
-  - histogram / percentiles
-- Throughput measurement
-
-**Rules**
-- Keep measurement overhead minimal.
-- Prefer batched stats aggregation to avoid perturbing latency.
-
----
-
-### 3.7 `tests/`
-**Responsibilities**
-- Unit tests for matching semantics.
-- Deterministic replay tests:
-  - fixed input → fixed output (golden file)
-
----
-
-## 4. Key Data Structures (Conceptual)
-
-### 4.1 Order lifetime
-1. `AddLimit`:
-   - allocate from `ObjectPool`
-   - insert into `OrderIndex`
-   - link into `PriceLevel` FIFO
-2. `Match`:
-   - decrement `qty_remaining`
-   - if 0: unlink, remove from index, return to pool
-3. `Cancel`:
-   - lookup via index
-   - unlink in O(1)
-   - remove from index, return to pool
-
-### 4.2 Event emission
-- Engine emits `Event` objects to an `EventSink` abstraction:
-  - in tests: `std::vector<Event>` (reserved)
-  - in perf mode: fixed-size ring buffer writer
-
----
-
-## 5. Threading Model
-
-### Phase 1/2
-- Single-threaded engine + local sinks (simplest, deterministic, easiest to benchmark)
-
-### Phase 3 (recommended)
-- Engine thread is the **single writer** of book state.
-- Gateway threads handle:
-  - socket I/O
-  - encoding/decoding
-- Communication via preallocated rings:
-  - `SPSC` rings are preferred when topology allows
-  - `MPSC` only if multiple RX threads are used (optional)
-
----
-
-## 6. Build Modes
-
-- **Debug**
-  - assertions enabled
-  - sanitizers optional
-- **Release**
-  - optimized build for normal usage
-- **Perf**
-  - forbids allocations (optional: override global `operator new` to abort)
-  - disables logging and heavy instrumentation
-
----
-
-## 7. Extensibility (Planned)
-
-- Multi-instrument:
-  - `InstrumentId -> OrderBook` mapping
-  - still enforce single-writer per book (or sharded engines)
-- More order types:
-  - IOC/FOK
-  - Market order (implemented as aggressive limit with sentinel price)
-- Market data snapshots:
-  - reconstruct from events
-  - or maintain incremental top-of-book in a separate component
+struct Command {
+  CmdType   type;
+  Side      side;       // valid for AddLimit
+  uint16_t  _pad0;
+  uint32_t  qty;        // 0 invalid
+  int64_t   price;      // 0 invalid for AddLimit
+  uint64_t  order_id;
+  uint64_t  order_id2;  // optional: used for Replace semantics
+};
